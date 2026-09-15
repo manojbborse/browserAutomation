@@ -3,8 +3,11 @@ namespace Novaritz.WebCapture;
 /// <summary>Settings bound from the "Capture" section of appsettings.json.</summary>
 public sealed class CaptureOptions
 {
-    /// <summary>Prompts per run. ChatGPT rate-limits quickly; start small.</summary>
-    public int BatchLimit { get; set; } = 10;
+    /// <summary>
+    /// Max prompts per start, across brands (a brand's set is ~14). A brand cut
+    /// off by this limit stays PENDING and is resumed by the next start.
+    /// </summary>
+    public int BatchLimit { get; set; } = 30;
 
     /// <summary>Seconds between prompts. Under 20 invites rate limiting.</summary>
     public double PauseSeconds { get; set; } = 30;

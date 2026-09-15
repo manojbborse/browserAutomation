@@ -1,20 +1,25 @@
-// Answer Novaritz prompts on chatgpt.com and store each answer against its client.
+// Answer each approved brand's stored prompts on chatgpt.com, one cycle at a time.
 //
 //     dotnet run -- login                 once: sign in by hand, session is saved
-//     dotnet run -- list [--limit N] [--brand "…"] [--client "…"]
-//                                         show the next pending prompts; touches nothing
-//     dotnet run -- run                   answers up to BatchLimit unanswered prompts
-//     dotnet run -- run --dry-run         same, but prints instead of writing to the DB
+//     dotnet run -- list [--brand "…"] [--client "…"]
+//                                         brands due in the current cycle; touches nothing
+//     dotnet run -- run                   works through the due brands, up to BatchLimit prompts
+//     dotnet run -- run --dry-run         asks, prints, writes nothing (no run rows either)
 //     dotnet run -- run --headless        no browser window (expect more challenges)
-//     dotnet run -- run --limit 3 --pause 45
-//     dotnet run -- run --limit 5 --brand "GK Merai"     only that brand's prompts
+//     dotnet run -- run --limit 30 --pause 45
+//     dotnet run -- run --brand "Nyati Elysia"    only that brand
+//     dotnet run -- run --client "Regency Group"  only that client's brands
 //
-// Each run: read the oldest prompts (from audit_jobs.result JSON) that have no
-// chatgpt.com answer yet, ask chatgpt.com one at a time with a pause between,
-// and write one chatgpt_web_responses row per answer. A prompt is attributed
-// to its client through audit_job -> organization. A run log goes to
-// <ResultsPath>/run-<timestamp>.jsonl, with a screenshot for every prompt that
-// did not end in an answer.
+// A brand is DUE when it is approved, has a prompt set (dbo.prompts) and has
+// no DONE capture inside the current cycle (cycle length = the client's plan
+// frequency; Daily = 1 day). For each due brand: claim today's
+// brand_capture_runs row, ask every prompt not yet answered in that run, save
+// one LLM_web_responses row per answer, mark the run DONE when all are
+// answered. Stopping early (--limit, logout, page changed) leaves the run
+// PENDING with its answers kept; the next start resumes it.
+//
+// A run log goes to <ResultsPath>/run-<timestamp>.jsonl, with a screenshot
+// for every prompt that did not end in an answer.
 
 using System.Text.Json;
 using Microsoft.Extensions.Configuration;
@@ -54,18 +59,18 @@ switch (command)
 
 async Task<int> ListAsync(string[] listArgs)
 {
-    // Read-only: the same query the run uses, printed instead of answered.
+    // Read-only: the same queue the run works through, printed.
     var repo = new PromptRepository(connectionString, options.LlmType);
-    var prompts = await repo.FetchUnansweredAsync(
-        IntArg(listArgs, "--limit") ?? options.BatchLimit, StrArg(listArgs, "--brand"), StrArg(listArgs, "--client"));
-    var unresolved = await repo.UnresolvedBrandsAsync();
-    if (unresolved.Count > 0)
-        Console.WriteLine($"Skipped (no brands row for): {string.Join(", ", unresolved)}");
-    if (prompts.Count == 0) { Console.WriteLine($"Nothing pending for {repo.LlmType}."); return 0; }
-    foreach (var (pr, i) in prompts.Select((p, i) => (p, i + 1)))
-        Console.WriteLine($"{i,3}. {pr.Client ?? "—"} / {pr.Brand} ({pr.BrandId.ToString()[..8]}) / {pr.PromptKey} [{pr.Intent}]{Environment.NewLine}     {pr.Text}");
+    await repo.EnsureSchemaAsync();
+    var queue = await repo.QueueAsync(StrArg(listArgs, "--brand"), StrArg(listArgs, "--client"));
+    if (queue.Count == 0) { Console.WriteLine($"Nothing due for {repo.LlmType} in the current cycle."); }
+    foreach (var (q, i) in queue.Select((q, i) => (q, i + 1)))
+        Console.WriteLine($"{i,3}. {q.Client} / {q.Brand} ({q.BrandId.ToString()[..8]})  {q.PromptsTotal} prompts, {q.Frequency}  " +
+                          (q.RunningRunId is not null ? $"[resume: {q.RunningAnswered}/{q.PromptsTotal} answered]"
+                           : q.LastDoneCycle is null ? "[never captured]"
+                           : $"[last done {q.LastDoneCycle:yyyy-MM-dd}, {q.DaysSinceDone} day(s) ago]"));
     var s = await repo.SummaryAsync();
-    Console.WriteLine($"{Environment.NewLine}Backlog: {s.Answered} of {s.Prompts} prompts have a {repo.LlmType} answer.");
+    Console.WriteLine($"{Environment.NewLine}{repo.LlmType}: {s.BrandsDue} brand(s) due, {s.BrandsDoneThisCycle} done this cycle, {s.AnswersToday} answers stored today.");
     return 0;
 }
 
@@ -73,83 +78,126 @@ async Task<int> RunAsync(string[] runArgs)
 {
     bool dryRun = runArgs.Contains("--dry-run");
     bool headless = runArgs.Contains("--headless");
-    int limit = IntArg(runArgs, "--limit") ?? options.BatchLimit;
+    int limit = IntArg(runArgs, "--limit") ?? options.BatchLimit;      // max prompts this start, across brands
     double pause = DoubleArg(runArgs, "--pause") ?? options.PauseSeconds;
-    string? brand = StrArg(runArgs, "--brand");     // exact brand_name, e.g. "GK Merai"
-    string? client = StrArg(runArgs, "--client");   // exact organization name, e.g. "GK Associates"
+    string? brand = StrArg(runArgs, "--brand");     // exact brand name, e.g. "Nyati Elysia"
+    string? client = StrArg(runArgs, "--client");   // exact organization name, e.g. "Regency Group"
 
     var repo = new PromptRepository(connectionString, options.LlmType);
-    await repo.EnsureSchemaAsync();   // creates only this app's own (empty) table; a dry run writes nothing else
-    var prompts = await repo.FetchUnansweredAsync(limit, brand, client);
-    if (prompts.Count == 0)
+    await repo.EnsureSchemaAsync();
+    var queue = await repo.QueueAsync(brand, client);
+    if (queue.Count == 0)
     {
-        Console.WriteLine($"Nothing to do: every prompt already has a {repo.LlmType} answer.");
+        Console.WriteLine($"Nothing to do: no brand is due for {repo.LlmType} in the current cycle.");
         return 0;
     }
-    Console.WriteLine($"{prompts.Count} prompt(s) to answer; {pause:0}s pause between; " +
-                      $"{(dryRun ? "DRY RUN — " : "")}writing to '{PromptRepository.Table}' as LLMType '{repo.LlmType}'.");
+    Console.WriteLine($"{queue.Count} brand(s) due ({queue.Sum(q => q.PromptsTotal)} prompts in total); up to {limit} prompt(s) this start; " +
+                      $"{pause:0}s pause between; {(dryRun ? "DRY RUN — nothing is written" : $"writing to '{PromptRepository.Table}' as LLMType '{repo.LlmType}'")}.");
 
     Directory.CreateDirectory(resultsDir);
     var runId = DateTime.UtcNow.ToString("yyyyMMdd'T'HHmmss'Z'");
-    var logPath = Path.Combine(resultsDir, $"run-{runId}.jsonl");
+    var logName = $"run-{runId}.jsonl";
+    var logPath = Path.Combine(resultsDir, logName);
     var tally = new Dictionary<string, int>();
+    int asked = 0, shot = 0;
+    bool stopAll = false;
 
     await using var web = new ChatGptWebClient(statePath, options.AnswerTimeoutSeconds, options.BrowserChannel);
     await web.OpenAsync(headless);
     try
     {
-        for (int i = 0; i < prompts.Count; i++)
+        foreach (var q in queue)
         {
-            var pr = prompts[i];
-            var n = i + 1;
-            Console.WriteLine($"[{n}/{prompts.Count}] {pr.Client ?? "—"} / {pr.Brand} / {pr.PromptKey}: {Truncate(pr.Text, 70)}…");
+            if (stopAll || asked >= limit) break;
 
-            AskResult r;
-            try { r = await web.AskAsync(pr.Text); }
-            catch (Exception ex) { r = new AskResult(Outcome.Error, 0, Error: $"{ex.GetType().Name}: {ex.Message}"); }
-
-            var record = new Dictionary<string, object?>
+            int? captureRunId = null;
+            IReadOnlyList<BrandPrompt> prompts;
+            if (dryRun)
             {
-                ["run"] = runId, ["at"] = DateTime.UtcNow.ToString("O"),
-                ["audit_job_id"] = pr.AuditJobId, ["brand_id"] = pr.BrandId, ["llm_type"] = repo.LlmType, ["prompt_key"] = pr.PromptKey,
-                ["client"] = pr.Client, ["brand"] = pr.Brand,
-                ["intent"] = pr.Intent, ["outcome"] = r.Outcome.ToString().ToLowerInvariant(),
-                ["seconds"] = r.Seconds, ["error"] = r.Error,
-            };
-
-            if (r.Outcome == Outcome.Answered && r.Answer is not null)
-            {
-                record["chars"] = r.Answer.Length;
-                if (dryRun)
-                {
-                    Console.WriteLine($"    → answered in {r.Seconds}s ({r.Answer.Length} chars) — not saved (dry run)");
-                }
-                else
-                {
-                    var id = await repo.SaveResponseAsync(pr, r.Answer, (int)(r.Seconds * 1000), r.RawText, r.CitationsJson, r.PlacesJson);
-                    record["response_id"] = id;
-                    Console.WriteLine($"    → answered in {r.Seconds}s, saved as {PromptRepository.Table} id {id}");
-                }
+                prompts = await repo.PendingPromptsAsync(q.RunningRunId ?? -1, q.BrandId);   // -1: nothing answered yet
             }
             else
             {
-                var shot = Path.Combine(resultsDir, $"run-{runId}-{n:00}-{record["outcome"]}.png");
-                try { await web.ScreenshotAsync(shot); record["screenshot"] = Path.GetFileName(shot); }
-                catch { /* a failed screenshot must not hide the real outcome */ }
-                Console.WriteLine($"    → {record["outcome"]} after {r.Seconds}s{(r.Error is null ? "" : $": {r.Error}")}");
+                captureRunId = await repo.ClaimRunAsync(q, logName);
+                if (captureRunId is null)
+                {
+                    Console.WriteLine($"— {q.Client} / {q.Brand}: skipped (another instance is on it, or already done today).");
+                    continue;
+                }
+                prompts = await repo.PendingPromptsAsync(captureRunId.Value, q.BrandId);
             }
+            Console.WriteLine($"{Environment.NewLine}== {q.Client} / {q.Brand}: {prompts.Count} of {q.PromptsTotal} prompt(s) to answer" +
+                              (captureRunId is null ? "" : $" (run #{captureRunId})"));
 
-            var key = (string)record["outcome"]!;
-            tally[key] = tally.GetValueOrDefault(key) + 1;
-            await File.AppendAllTextAsync(logPath, JsonSerializer.Serialize(record) + Environment.NewLine);
-
-            if (r.ShouldStopRun)
+            string? stopReason = null;
+            bool hardFailure = false;
+            foreach (var p in prompts)
             {
-                Console.WriteLine("Stopping: the page is no longer the chat. See the screenshot in results/.");
-                break;
+                if (asked >= limit) { stopReason = $"--limit {limit} reached"; break; }
+                asked++;
+                Console.WriteLine($"[{asked}/{limit}] {q.Brand} / {p.PromptKey}: {Truncate(p.Text, 70)}…");
+
+                AskResult r;
+                try { r = await web.AskAsync(p.Text); }
+                catch (Exception ex) { r = new AskResult(Outcome.Error, 0, Error: $"{ex.GetType().Name}: {ex.Message}"); }
+
+                var record = new Dictionary<string, object?>
+                {
+                    ["run"] = runId, ["at"] = DateTime.UtcNow.ToString("O"),
+                    ["capture_run_id"] = captureRunId, ["brand_id"] = q.BrandId, ["prompt_id"] = p.PromptId,
+                    ["llm_type"] = repo.LlmType, ["prompt_key"] = p.PromptKey,
+                    ["client"] = q.Client, ["brand"] = q.Brand,
+                    ["intent"] = p.Intent, ["outcome"] = r.Outcome.ToString().ToLowerInvariant(),
+                    ["seconds"] = r.Seconds, ["error"] = r.Error,
+                };
+
+                if (r.Outcome == Outcome.Answered && r.Answer is not null)
+                {
+                    record["chars"] = r.Answer.Length;
+                    if (dryRun)
+                    {
+                        Console.WriteLine($"    → answered in {r.Seconds}s ({r.Answer.Length} chars) — not saved (dry run)");
+                    }
+                    else
+                    {
+                        var id = await repo.SaveResponseAsync(captureRunId!.Value, q, p, r.Answer, (int)(r.Seconds * 1000),
+                                                              r.RawText, r.CitationsJson, r.PlacesJson);
+                        record["response_id"] = id;
+                        Console.WriteLine($"    → answered in {r.Seconds}s, saved as {PromptRepository.Table} id {id}");
+                    }
+                }
+                else
+                {
+                    shot++;
+                    var png = Path.Combine(resultsDir, $"run-{runId}-{shot:00}-{record["outcome"]}.png");
+                    try { await web.ScreenshotAsync(png); record["screenshot"] = Path.GetFileName(png); }
+                    catch { /* a failed screenshot must not hide the real outcome */ }
+                    Console.WriteLine($"    → {record["outcome"]} after {r.Seconds}s{(r.Error is null ? "" : $": {r.Error}")}");
+                }
+
+                var key = (string)record["outcome"]!;
+                tally[key] = tally.GetValueOrDefault(key) + 1;
+                await File.AppendAllTextAsync(logPath, JsonSerializer.Serialize(record) + Environment.NewLine);
+
+                if (r.ShouldStopRun)
+                {
+                    stopReason = $"page is no longer the chat ({record["outcome"]}); see the screenshot in results/";
+                    stopAll = true;
+                    break;
+                }
+                if (asked < limit)
+                    await Task.Delay(TimeSpan.FromSeconds(pause));
             }
-            if (n < prompts.Count)
-                await Task.Delay(TimeSpan.FromSeconds(pause));
+
+            if (captureRunId is not null)
+            {
+                var status = await repo.FinishRunAsync(captureRunId.Value, stopReason, hardFailure);
+                Console.WriteLine($"== {q.Brand}: {status}{(stopReason is null ? "" : $" — {stopReason}")}");
+            }
+            else if (stopReason is not null)
+            {
+                Console.WriteLine($"== {q.Brand}: stopped — {stopReason}");
+            }
         }
     }
     finally
@@ -160,7 +208,7 @@ async Task<int> RunAsync(string[] runArgs)
     Console.WriteLine();
     Console.WriteLine("Outcomes: " + JsonSerializer.Serialize(tally));
     var s = await repo.SummaryAsync();
-    Console.WriteLine($"Backlog: {s.Answered} of {s.Prompts} prompts have a {repo.LlmType} answer.");
+    Console.WriteLine($"{repo.LlmType}: {s.BrandsDue} brand(s) still due, {s.BrandsDoneThisCycle} done this cycle, {s.AnswersToday} answers stored today.");
     Console.WriteLine($"Log: {logPath}");
     return 0;
 }

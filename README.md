@@ -1,22 +1,30 @@
 # Novaritz — browser automation (LLM web capture)
 
-A .NET 8 console app that takes the prompts clients already have in the
-Novaritz database, asks each one on chatgpt.com through a real Chrome
-window (Playwright), and stores the answer back in the same database
-against the same client and brand.
+A .NET 8 console app that takes each approved brand's stored prompt set
+from the Novaritz database, asks the prompts on chatgpt.com through a real
+Chrome window (Playwright), and stores the answers back in the same
+database against the brand and its client — once per cycle.
 
 It is a separate application from the Novaritz backend and modifies none
-of its tables. It reads each audit's prompts from `audit_jobs.result`
-(JSON, via `OPENJSON`) and writes one row per answer to its own table,
-`LLM_web_responses`. A row is attributed to the client through
-`audit_job → organization` and to the brand through `brand_ai_profiles`
-(matched on name). `UNIQUE (audit_job_id, prompt_key, LLMType)` means a
-prompt is never answered twice by the same LLM — re-running continues
-where it stopped.
+of the backend's tables. It works **per brand, per cycle**:
+
+- A brand is **due** when it is approved (`brand_entities`), has a prompt
+  set (`prompts`) and has no `DONE` capture inside the current cycle. The
+  cycle length is the client's plan frequency (`pricing.frequency`; Daily
+  = 1 day). `dbo.fn_capture_queue(@llm)` (SQL script 010) is the queue.
+- For each due brand the tool claims today's `brand_capture_runs` row,
+  asks every prompt not yet answered in that run, writes one
+  `LLM_web_responses` row per answer, and marks the run `DONE` when all
+  prompts are answered. Stopping early (`--limit`, a logout, the page
+  changing) leaves the run `PENDING` with its answers kept; the next start
+  resumes it. Every cycle keeps its own answers, so a brand's replies can
+  be compared day by day.
+- `LLMType` records which LLM answered (`chatgpt` today), so other engines
+  can be added alongside with their own cycles.
 
 **Database: Microsoft SQL Server** — Azure SQL Database in production, a
-local SQL Server 2019 copy for testing. `LLMType` records which LLM
-answered (`chatgpt` today), so other engines can be added alongside.
+local SQL Server 2019 copy for testing. The tool refuses to start against a
+database that has not had script 010 applied.
 
 ## Rules
 
@@ -46,15 +54,17 @@ dotnet run -- login                          # once: sign in by hand; press Ente
 ## Running
 
 ```powershell
-dotnet run -- list --limit 5                 # next pending prompts, read-only — touches nothing
-dotnet run -- list --brand "Nyati Emerald"
+dotnet run -- list                           # brands due in the current cycle, read-only
+dotnet run -- list --client "Regency Group"
 dotnet run -- run --dry-run --limit 1        # asks ChatGPT, prints, writes nothing
-dotnet run -- run --limit 5 --brand "GK Merai"
-dotnet run -- run --client "Regency Group"   # every pending prompt for one client
+dotnet run -- run                            # works through the due brands, up to BatchLimit prompts
+dotnet run -- run --brand "Nyati Elysia"     # only that brand
+dotnet run -- run --client "Regency Group"   # only that client's brands
 ```
 
 `login.cmd` / `run.cmd` in the project folder do the same by double-click
-(`run.cmd --limit 5 --brand "GK Merai"` works too).
+(`run.cmd --brand "Nyati Elysia"` works too). A daily Task Scheduler job
+running `run.cmd --headless` is what makes "once per cycle" happen.
 
 ## Settings
 
@@ -63,7 +73,7 @@ dotnet run -- run --client "Regency Group"   # every pending prompt for one clie
 | Key | Meaning |
 |---|---|
 | `ConnectionStrings:Novaritz` | SQL Server connection (local Windows-auth by default) |
-| `Capture:BatchLimit` | Prompts per run unless `--limit` is given |
+| `Capture:BatchLimit` | Max prompts per start, across brands, unless `--limit` is given (a cut-off brand resumes next start) |
 | `Capture:PauseSeconds` | Pause between prompts |
 | `Capture:AnswerTimeoutSeconds` | How long to wait for a reply |
 | `Capture:StatePath` | Where the saved ChatGPT session lives |
@@ -86,7 +96,7 @@ signed `dotnet` host.
 
 | Column | Contents |
 |---|---|
-| `LLMType`, `brandId`, `audit_job_id`, `organization_id`, `prompt_key`, `prompt_text`, `intent` | Which LLM, brand, run, client and prompt |
+| `capture_run_id`, `prompt_id`, `LLMType`, `brandId`, `organization_id`, `prompt_key`, `prompt_text`, `intent` | Which cycle run, prompt, LLM, brand and client (`audit_job_id` is the pre-cycle link, kept on old rows) |
 | `answer` | The prose of the reply — map widgets, place cards and citation pills removed |
 | `citations` | JSON list of `{text, href}` for the source pills the LLM showed |
 | `places` | JSON list of `{name, rating, text}` for map/business cards, when any were rendered |

@@ -1,0 +1,16 @@
+# build output
+bin/
+obj/
+*.user
+.vs/
+
+# never commit these: the saved ChatGPT session IS a login, and results hold captured answers
+state/
+results/
+storage_state.json
+*.log
+
+# secrets live in `dotnet user-secrets`, not in files
+appsettings.*.json
+!appsettings.json
+.env

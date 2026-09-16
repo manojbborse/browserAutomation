@@ -19,8 +19,11 @@ of the backend's tables. It works **per brand, per cycle**:
   changing) leaves the run `PENDING` with its answers kept; the next start
   resumes it. Every cycle keeps its own answers, so a brand's replies can
   be compared day by day.
-- `LLMType` records which LLM answered (`chatgpt` today), so other engines
-  can be added alongside with their own cycles.
+- Two engines: **ChatGPT** (chatgpt.com) and **Gemini** (gemini.google.com),
+  chosen with `--llm chatgpt|gemini`. Each has its own saved session
+  (`storage_state.json` / `storage_state.gemini.json`), its own cycle rows,
+  and is only run for brands whose plan includes it (`pricing.llmsupport`,
+  SQL script 011).
 
 **Database: Microsoft SQL Server** — Azure SQL Database in production, a
 local SQL Server 2019 copy for testing. The tool refuses to start against a
@@ -48,7 +51,8 @@ database that has not had script 010 applied.
 ```powershell
 cd Novaritz.WebCapture
 dotnet build
-dotnet run -- login                          # once: sign in by hand; press Enter in the console when the chat box shows
+dotnet run -- login                          # once: sign in to ChatGPT by hand; press Enter in the console when the chat box shows
+dotnet run -- login --llm gemini             # once: the same for Gemini, with the dedicated Google account
 ```
 
 ## Running
@@ -60,6 +64,7 @@ dotnet run -- run --dry-run --limit 1        # asks ChatGPT, prints, writes noth
 dotnet run -- run                            # works through the due brands, up to BatchLimit prompts
 dotnet run -- run --brand "Nyati Elysia"     # only that brand
 dotnet run -- run --client "Regency Group"   # only that client's brands
+dotnet run -- run --llm gemini               # the Gemini cycle (Pro-plan brands)
 ```
 
 `login.cmd` / `run.cmd` in the project folder do the same by double-click
@@ -79,7 +84,7 @@ running `run.cmd --headless` is what makes "once per cycle" happen.
 | `Capture:StatePath` | Where the saved ChatGPT session lives |
 | `Capture:ResultsPath` | Run logs (`run-<timestamp>.jsonl`) and failure screenshots |
 | `Capture:BrowserChannel` | `chrome` (installed Chrome); empty for bundled Chromium |
-| `Capture:LlmType` | Value written to `LLMType` (`chatgpt`) |
+| `Capture:LlmType` | Default engine when `--llm` is not given (`chatgpt`) |
 
 Production connection string, kept out of the repo:
 
@@ -98,11 +103,14 @@ signed `dotnet` host.
 |---|---|
 | `capture_run_id`, `prompt_id`, `LLMType`, `brandId`, `organization_id`, `prompt_key`, `prompt_text`, `intent` | Which cycle run, prompt, LLM, brand and client (`audit_job_id` is the pre-cycle link, kept on old rows) |
 | `answer` | The prose of the reply — map widgets, place cards and citation pills removed |
-| `citations` | JSON list of `{text, href}` for the source pills the LLM showed |
+| `citations` | JSON list of `{text, href}` — ChatGPT's source pills, or the links behind Gemini's source chips (read from their hover cards) |
 | `places` | JSON list of `{name, rating, text}` for map/business cards, when any were rendered |
 | `raw_text` | The whole message as displayed, untouched |
 | `latency_ms`, `captured_at`, `createdDate` | Timing |
 
-A Python implementation with identical behaviour lives alongside this
-project outside the repository; keep the two in step when changing the
-extraction or the SQL.
+A Python implementation lives alongside this project outside the
+repository; it has the ChatGPT client and the cycle logic but not Gemini
+yet. Keep the two in step when changing the SQL.
+
+Debugging a changed page: set `NOVARITZ_DEBUG_DUMP=<folder>` and run a
+`--dry-run --limit 1`; the Gemini client saves the answer's HTML there.

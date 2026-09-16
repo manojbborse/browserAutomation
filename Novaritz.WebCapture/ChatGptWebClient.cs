@@ -26,7 +26,7 @@ public sealed record AskResult(Outcome Outcome, double Seconds, string? Answer =
 /// a different network, a refreshed session), not code that pretends to be
 /// a person.
 /// </summary>
-public sealed class ChatGptWebClient : IAsyncDisposable
+public sealed class ChatGptWebClient : IWebLlmClient
 {
     private const string Home = "https://chatgpt.com/";
 

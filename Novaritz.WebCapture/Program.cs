@@ -1,7 +1,7 @@
 // Answer each approved brand's stored prompts on chatgpt.com, one cycle at a time.
 //
-//     dotnet run -- login                 once: sign in by hand, session is saved
-//     dotnet run -- list [--brand "…"] [--client "…"]
+//     dotnet run -- login [--llm gemini]  once per LLM: sign in by hand, session is saved
+//     dotnet run -- list [--llm gemini] [--brand "…"] [--client "…"]
 //                                         brands due in the current cycle; touches nothing
 //     dotnet run -- run                   works through the due brands, up to BatchLimit prompts
 //     dotnet run -- run --dry-run         asks, prints, writes nothing (no run rows either)
@@ -9,6 +9,13 @@
 //     dotnet run -- run --limit 30 --pause 45
 //     dotnet run -- run --brand "Nyati Elysia"    only that brand
 //     dotnet run -- run --client "Regency Group"  only that client's brands
+//     dotnet run -- run --llm gemini              capture with Gemini instead of ChatGPT
+//
+// --llm picks the web client and the LLMType written to the database
+// (default: Capture:LlmType in appsettings, "chatgpt"). Each LLM has its own
+// saved session file (storage_state.json / storage_state.gemini.json) and its
+// own cycle rows; a brand is due for an LLM only if the client's plan
+// includes it (pricing.llmsupport, SQL script 011).
 //
 // A brand is DUE when it is approved, has a prompt set (dbo.prompts) and has
 // no DONE capture inside the current cycle (cycle length = the client's plan
@@ -39,28 +46,36 @@ var connectionString = config.GetConnectionString("Novaritz")
 
 // Relative paths in appsettings are relative to the project folder, not bin/.
 string Resolve(string p) => Path.GetFullPath(p, ProjectDir());
-var statePath = Resolve(options.StatePath);
 var resultsDir = Resolve(options.ResultsPath);
+
+// Which LLM this start works for: --llm on the command line beats appsettings.
+var llmType = (StrArg(args, "--llm") ?? options.LlmType).Trim().ToLowerInvariant();
+if (!WebClients.Supported.Contains(llmType))
+{
+    Console.Error.WriteLine($"Unknown --llm '{llmType}'. Supported: {string.Join(", ", WebClients.Supported)}.");
+    return 2;
+}
+var statePath = WebClients.StatePathFor(llmType, Resolve(options.StatePath));
 
 var command = args.FirstOrDefault() ?? "run";
 switch (command)
 {
     case "login":
-        await ChatGptWebClient.LoginInteractiveAsync(statePath, options.BrowserChannel);
+        await WebClients.LoginInteractiveAsync(llmType, statePath, options.BrowserChannel);
         return 0;
     case "list":
         return await ListAsync(args.Skip(1).ToArray());
     case "run":
         return await RunAsync(args.Skip(1).ToArray());
     default:
-        Console.Error.WriteLine($"Unknown command '{command}'. Use: login | list | run [--dry-run] [--headless] [--limit N] [--pause S] [--brand X] [--client X]");
+        Console.Error.WriteLine($"Unknown command '{command}'. Use: login | list | run [--llm chatgpt|gemini] [--dry-run] [--headless] [--limit N] [--pause S] [--brand X] [--client X]");
         return 2;
 }
 
 async Task<int> ListAsync(string[] listArgs)
 {
     // Read-only: the same queue the run works through, printed.
-    var repo = new PromptRepository(connectionString, options.LlmType);
+    var repo = new PromptRepository(connectionString, llmType);
     await repo.EnsureSchemaAsync();
     var queue = await repo.QueueAsync(StrArg(listArgs, "--brand"), StrArg(listArgs, "--client"));
     if (queue.Count == 0) { Console.WriteLine($"Nothing due for {repo.LlmType} in the current cycle."); }
@@ -83,7 +98,7 @@ async Task<int> RunAsync(string[] runArgs)
     string? brand = StrArg(runArgs, "--brand");     // exact brand name, e.g. "Nyati Elysia"
     string? client = StrArg(runArgs, "--client");   // exact organization name, e.g. "Regency Group"
 
-    var repo = new PromptRepository(connectionString, options.LlmType);
+    var repo = new PromptRepository(connectionString, llmType);
     await repo.EnsureSchemaAsync();
     var queue = await repo.QueueAsync(brand, client);
     if (queue.Count == 0)
@@ -102,7 +117,7 @@ async Task<int> RunAsync(string[] runArgs)
     int asked = 0, shot = 0;
     bool stopAll = false;
 
-    await using var web = new ChatGptWebClient(statePath, options.AnswerTimeoutSeconds, options.BrowserChannel);
+    await using var web = WebClients.Create(llmType, statePath, options.AnswerTimeoutSeconds, options.BrowserChannel);
     await web.OpenAsync(headless);
     try
     {
@@ -154,9 +169,12 @@ async Task<int> RunAsync(string[] runArgs)
                 if (r.Outcome == Outcome.Answered && r.Answer is not null)
                 {
                     record["chars"] = r.Answer.Length;
+                    record["citations"] = r.CitationsJson is null ? 0 : JsonDocument.Parse(r.CitationsJson).RootElement.GetArrayLength();
                     if (dryRun)
                     {
-                        Console.WriteLine($"    → answered in {r.Seconds}s ({r.Answer.Length} chars) — not saved (dry run)");
+                        Console.WriteLine($"    → answered in {r.Seconds}s ({r.Answer.Length} chars, {record["citations"]} source(s)) — not saved (dry run)");
+                        if (r.CitationsJson is not null) Console.WriteLine($"      sources: {Truncate(r.CitationsJson, 600)}");
+                        Console.WriteLine($"      ends with: …{r.Answer[Math.Max(0, r.Answer.Length - 160)..].Replace('\n', ' ')}");
                     }
                     else
                     {

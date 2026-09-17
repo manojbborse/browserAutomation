@@ -228,6 +228,13 @@ public sealed class ChatGptWebClient : IWebLlmClient
         try { body = await page.InnerTextAsync("body", new() { Timeout = 3000 }); }
         catch (TimeoutException) { }
 
+        // Cloudflare's interstitial: title "Just a moment…" and the Turnstile
+        // widget in an iframe, whose text never reaches body.innerText.
+        var title = "";
+        try { title = await page.TitleAsync(); } catch { }
+        if (title.StartsWith("Just a moment", StringComparison.OrdinalIgnoreCase)
+            || await page.Locator("iframe[src*=\"challenges.cloudflare.com\"], #challenge-form, .cf-turnstile").CountAsync() > 0)
+            return Outcome.Challenge;
         if (ChallengeText.Any(body.Contains)) return Outcome.Challenge;
         if (await page.Locator(Composer).CountAsync() > 0) return Outcome.Answered;
         if (LoginText.Any(body.Contains)) return Outcome.Login;

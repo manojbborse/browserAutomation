@@ -23,7 +23,8 @@
 // brand_capture_runs row, ask every prompt not yet answered in that run, save
 // one LLM_web_responses row per answer, mark the run DONE when all are
 // answered. Stopping early (--limit, logout, page changed) leaves the run
-// PENDING with its answers kept; the next start resumes it.
+// PENDING with its answers kept; the next start resumes it — even on a later
+// day: an unfinished earlier cycle is completed first, then today's begins.
 //
 // A run log goes to <ResultsPath>/run-<timestamp>.jsonl, with a screenshot
 // for every prompt that did not end in an answer.
@@ -123,26 +124,33 @@ async Task<int> RunAsync(string[] runArgs)
     {
         foreach (var q in queue)
         {
+          // A brand may need two runs in one start: an unfinished earlier
+          // cycle first, then today's. Loop until today's run is settled.
+          for (var pass = 0; pass < 3; pass++)
+          {
             if (stopAll || asked >= limit) break;
 
             int? captureRunId = null;
+            ClaimedRun? claimed = null;
             IReadOnlyList<BrandPrompt> prompts;
             if (dryRun)
             {
+                if (pass > 0) break;
                 prompts = await repo.PendingPromptsAsync(q.RunningRunId ?? -1, q.BrandId);   // -1: nothing answered yet
             }
             else
             {
-                captureRunId = await repo.ClaimRunAsync(q, logName);
-                if (captureRunId is null)
+                claimed = await repo.ClaimRunAsync(q, logName);
+                if (claimed is null)
                 {
-                    Console.WriteLine($"— {q.Client} / {q.Brand}: skipped (another instance is on it, or already done today).");
-                    continue;
+                    if (pass == 0) Console.WriteLine($"— {q.Client} / {q.Brand}: skipped (another instance is on it, or already done today).");
+                    break;
                 }
+                captureRunId = claimed.Id;
                 prompts = await repo.PendingPromptsAsync(captureRunId.Value, q.BrandId);
             }
             Console.WriteLine($"{Environment.NewLine}== {q.Client} / {q.Brand}: {prompts.Count} of {q.PromptsTotal} prompt(s) to answer" +
-                              (captureRunId is null ? "" : $" (run #{captureRunId})"));
+                              (captureRunId is null ? "" : $" (run #{captureRunId}, cycle {claimed!.CycleDate:yyyy-MM-dd}{(claimed.IsToday ? "" : " — finishing an earlier cycle")})"));
 
             string? stopReason = null;
             bool hardFailure = false;
@@ -211,11 +219,14 @@ async Task<int> RunAsync(string[] runArgs)
             {
                 var status = await repo.FinishRunAsync(captureRunId.Value, stopReason, hardFailure);
                 Console.WriteLine($"== {q.Brand}: {status}{(stopReason is null ? "" : $" — {stopReason}")}");
+                if (status == "DONE" && !claimed!.IsToday) continue;   // earlier cycle finished: now claim today's
             }
             else if (stopReason is not null)
             {
                 Console.WriteLine($"== {q.Brand}: stopped — {stopReason}");
             }
+            break;
+          }
         }
     }
     finally

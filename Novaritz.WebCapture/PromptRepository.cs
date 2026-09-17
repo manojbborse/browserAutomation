@@ -12,6 +12,12 @@ public sealed record QueuedBrand(
 /// <summary>One of a brand's stored prompts (dbo.prompts) not yet answered in this run.</summary>
 public sealed record BrandPrompt(Guid PromptId, string PromptKey, string Text, string? Intent);
 
+/// <summary>The run a start works on: its id and the cycle date it belongs to (may be an earlier day being finished).</summary>
+public sealed record ClaimedRun(int Id, DateTime CycleDate)
+{
+    public bool IsToday => CycleDate.Date == DateTime.UtcNow.Date;
+}
+
 /// <summary>Where the LLM stands: brands due now, and runs finished in the current cycle.</summary>
 public sealed record Backlog(int BrandsDue, int BrandsDoneThisCycle, long AnswersToday);
 
@@ -89,47 +95,61 @@ public sealed class PromptRepository
     }
 
     /// <summary>
-    /// Take the brand for today's cycle: reuse today's RUNNING/PENDING row (resume),
-    /// take over a stale one, or insert a new one. Returns null when another
-    /// instance is actively running it, or when today is already DONE.
+    /// Take the brand's next run: an unfinished earlier run first (PENDING, or
+    /// RUNNING but stale — e.g. yesterday's run that stopped at 12/14 keeps its
+    /// own cycle date and is completed), else today's row (resume it, or insert
+    /// it). Returns null when another instance is actively on it, or when
+    /// today is already DONE. The caller loops: after an earlier run finishes,
+    /// claiming again yields today's.
     /// </summary>
-    public async Task<int?> ClaimRunAsync(QueuedBrand q, string runLog)
+    public async Task<ClaimedRun?> ClaimRunAsync(QueuedBrand q, string runLog)
     {
         const string sql = """
             SET NOCOUNT ON;
             DECLARE @today DATE = CAST(SYSUTCDATETIME() AS date);
-            DECLARE @id INT, @status NVARCHAR(16), @started DATETIME2(3);
-            SELECT @id = id, @status = status, @started = started_at
+            DECLARE @stale DATETIME2(3) = DATEADD(second, -@staleSeconds, SYSUTCDATETIME());
+            DECLARE @id INT, @cycle DATE, @status NVARCHAR(16), @started DATETIME2(3), @log NVARCHAR(64);
+
+            -- 1. an unfinished run from any day: PENDING, or RUNNING and abandoned
+            SELECT TOP (1) @id = id, @cycle = cycle_date, @status = status, @started = started_at, @log = run_log
             FROM dbo.brand_capture_runs
-            WHERE brandId = @brandId AND LLMType = @llm AND cycle_date = @today;
+            WHERE brandId = @brandId AND LLMType = @llm
+              AND (status = N'PENDING' OR (status = N'RUNNING' AND (started_at < @stale OR run_log = @runLog)))
+            ORDER BY cycle_date;
+
+            -- 2. otherwise today's row, whatever its state
+            IF @id IS NULL
+                SELECT @id = id, @cycle = cycle_date, @status = status, @started = started_at, @log = run_log
+                FROM dbo.brand_capture_runs
+                WHERE brandId = @brandId AND LLMType = @llm AND cycle_date = @today;
 
             IF @id IS NULL
             BEGIN
                 INSERT INTO dbo.brand_capture_runs
                     (brandId, organization_id, LLMType, cycle_date, status, prompts_total, prompts_answered, started_at, run_log)
                 VALUES (@brandId, @orgId, @llm, @today, N'RUNNING', @total, 0, SYSUTCDATETIME(), @runLog);
-                SELECT SCOPE_IDENTITY();
+                SELECT CAST(SCOPE_IDENTITY() AS INT) AS Id, @today AS CycleDate;
             END
             ELSE IF @status = N'DONE'
-                SELECT NULL;
-            ELSE IF @status = N'RUNNING' AND @started > DATEADD(second, -@staleSeconds, SYSUTCDATETIME()) AND @runLog <> ISNULL((SELECT run_log FROM dbo.brand_capture_runs WHERE id = @id), N'')
-                SELECT NULL;    -- someone else is on it right now
+                SELECT CAST(NULL AS INT) AS Id, CAST(NULL AS DATE) AS CycleDate;
+            ELSE IF @status = N'RUNNING' AND @started >= @stale AND ISNULL(@log, N'') <> @runLog
+                SELECT CAST(NULL AS INT) AS Id, CAST(NULL AS DATE) AS CycleDate;    -- someone else is on it right now
             ELSE
             BEGIN
                 UPDATE dbo.brand_capture_runs
                 SET status = N'RUNNING', started_at = SYSUTCDATETIME(), prompts_total = @total, run_log = @runLog,
                     last_error = NULL, finished_at = NULL
                 WHERE id = @id;
-                SELECT @id;
+                SELECT @id AS Id, @cycle AS CycleDate;
             END
             """;
         await using var conn = Open();
-        var id = await conn.ExecuteScalarAsync<int?>(sql, new
+        var row = await conn.QuerySingleAsync<(int? Id, DateTime? CycleDate)>(sql, new
         {
             brandId = q.BrandId, orgId = q.OrganizationId, llm = _llmType, total = q.PromptsTotal, runLog,
             staleSeconds = (int)StaleRunAfter.TotalSeconds,
         });
-        return id;
+        return row.Id is null ? null : new ClaimedRun(row.Id.Value, row.CycleDate!.Value);
     }
 
     /// <summary>The brand's prompts (dbo.prompts, key order) not yet answered in this run.</summary>
